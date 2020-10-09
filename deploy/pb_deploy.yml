@@ -1,0 +1,37 @@
+---
+- hosts: all
+  become: yes
+
+  vars:
+    pip_install_packages:
+      - name: docker 
+      - name: docker-compose
+    airflow_vars:
+      KEYBUNCH_DROP_ALL_TABLE: "no"
+      EMAIL_RECIPIENTS: "\"{{ EMAIL_RECIPIENTS }}\""
+      START_DATE:  "{{ ansible_date_time.date }}"
+
+  tasks:
+    - name: Update apt-get repo and cache
+      apt: update_cache=yes force_apt_get=yes cache_valid_time=3600
+
+    - name: Install PIP
+      import_role:
+        name: geerlingguy.pip
+
+    - name: Install Docker
+      import_role:
+        name: geerlingguy.docker
+
+    - name: Install Keybunch app
+      import_role:
+        name: keybunch_airflow
+      tags:
+        - airflow
+
+    - name: Install client's PostgreSQL
+      when: data_base == "postgres"
+      import_role:
+        name: clients_postgres
+      tags:
+        - client_postgres

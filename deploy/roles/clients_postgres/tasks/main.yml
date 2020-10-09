@@ -1,0 +1,205 @@
+- name: Add the user '{{ ansible_user }}' to the 'docker' group
+  user:
+    name: "{{ ansible_user }}"
+    group: docker
+    append: yes
+  tags:
+    - update_client_postgres
+
+- name: Create volume mounting dir for PostgreSQL
+  file:
+    path: "/var/{{ client_postgres_container_name }}/data"
+    state: directory
+    mode: '750'
+  tags:
+    - update_client_postgres
+
+- name: Edit sysctl.conf and OS enviroment
+  command: "{{ item }}"
+  with_items:
+    - sysctl -w kernel.shmmax=4185919488
+    - sysctl -w kernel.shmall=1021953
+    - sysctl -w vm.swappiness=0
+    - sysctl -w vm.overcommit_ratio=100
+    - sysctl -w vm.overcommit_memory=2
+    - sysctl -p
+    - hdparm -W 0 /dev/sda
+    - blockdev --setra 4096 /dev/sda
+  tags:
+    - update_client_postgres
+
+- name: Add 'blockdev --setra 4096 /dev/sda' to /etc/rc.local
+  lineinfile:
+    path: /etc/rc.local
+    line: "blockdev --setra 4096 /dev/sda\n"
+    regexp: "blockdev --setra 4096 /dev/sda\n"
+    insertbefore: "^exit 0"
+  tags:
+    - update_client_postgres
+
+- name: Remount server
+  mount:
+    path: /
+    state: remounted
+  tags:
+    - update_client_postgres
+
+- name: Install PostgreSQL
+  docker_container:
+    name: "{{ client_postgres_container_name }}"
+    image: "postgres:{{ client_postgres_version }}"
+    interactive: true
+    tty: true
+    restart_policy: always
+    ports:
+      - "{{ postgres_port }}:5432"
+    env:
+      POSTGRES_PASSWORD: "{{ postgreSQL_postgres_pass }}"
+    volumes:
+      - "/var/{{ client_postgres_container_name }}/data:/var/lib/postgresql/data"
+      - "/opt/keybunch/fetch:/opt/keybunch/fetch"
+    command: >
+      postgres
+      -c listen_addresses=*
+      -c shared_buffers={{ (ansible_memtotal_mb * postgres_shared_buffers_ratio)|int }}MB
+      -c fsync=off
+      -c wal_buffers=16MB
+      -c max_wal_size=6144MB
+      -c checkpoint_timeout=20min
+      -c checkpoint_completion_target=0.9
+      -c work_mem=256MB
+      -c maintenance_work_mem=384MB
+      -c effective_cache_size=4GB
+      -c vm.overcommit_ratio=100
+      -c temp_buffers=32MB
+  tags:
+    - update_client_postgres
+
+- name: Change ownership of /opt/keybunch/fetch
+  file:
+    path: /opt/keybunch/fetch
+    state: directory
+    recurse: yes
+    owner: "{{ ansible_user }}"
+    group: docker
+  tags:
+    - update_client_postgres
+
+- name: Change permissions for /opt/keybunch/fetch in container
+  command: >
+    docker exec -it {{ client_postgres_container_name }} bash -c "chmod 777 /opt/keybunch/fetch"
+  register: out
+  tags:
+    - update_client_postgres
+- debug: var=out.stdout_lines
+  tags:
+    - update_client_postgres
+
+- name: Wait for PostgreSQL to start up before proceeding
+  ignore_errors: yes
+  command: >
+    docker exec -it {{ client_postgres_container_name }}
+    psql -U postgres -c "SELECT pg_size_pretty(pg_database_size(current_database()))"
+  args:
+    warn: false
+  register: result
+  until: result is succeeded
+  retries: 20
+  delay: 5
+  changed_when: false
+  check_mode: false
+  tags:
+    - update_client_postgres
+
+- name: Create new user in PostgreSQL
+  command: >
+    docker exec -it {{ client_postgres_container_name }}
+    psql -U postgres -c
+    "CREATE USER {{ client_postgres_user }} WITH PASSWORD '{{ postgreSQL_db_pass }}' CREATEDB;
+    GRANT pg_read_server_files TO {{ client_postgres_user }};
+    GRANT pg_execute_server_program  TO {{ client_postgres_user }};"
+  register: out
+- debug: var=out.stdout_lines
+
+- name: Create new database in PostgreSQL
+  command: >
+    docker exec -it {{ client_postgres_container_name }}
+    psql -U {{ client_postgres_user }} -d postgres -c "CREATE DATABASE {{ client_name }}"
+  register: out
+- debug: var=out.stdout_lines
+
+- name: Apt update
+  command: >
+    docker exec -it {{ client_postgres_container_name }} bash -c "apt-get update;"
+  register: out
+  tags:
+    - update_client_postgres
+
+- name: Install plpython3
+  command: >
+    docker exec -it {{ client_postgres_container_name }} bash -c
+    "apt-get -qq -y install postgresql-plpython3-11;"
+  register: out
+  tags:
+    - update_client_postgres
+- debug: var=out.stdout_lines
+  tags:
+    - update_client_postgres
+
+- name: Create extension plpython3u
+  command: >
+    docker exec -it {{ client_postgres_container_name }}
+    psql -U postgres -d {{ client_name }}  -c "CREATE EXTENSION plpython3u"
+  register: out
+- debug: var=out.stdout_lines
+
+- name: Create functions from pg_udfs
+  command: >
+    docker exec -it {{ client_postgres_container_name }}
+    psql -U postgres -d {{ client_name }}  -c "{{ pg_udfs }}"
+  register: out
+- debug: var=out.stdout_lines
+
+- name: Create pylowers function
+  command: >
+    docker exec -it {{ client_postgres_container_name }}
+    psql -U postgres -d {{ client_name }}  -c
+    "CREATE OR REPLACE FUNCTION pylowers (a text)
+    RETURNS text AS
+    $BODY$
+        if a:
+            return a.lower()
+        else:
+            return None
+    $BODY$
+    LANGUAGE plpython3u;"
+  register: out
+- debug: var=out.stdout_lines
+
+- name: Revoke connect from public on new database
+  ignore_errors: yes
+  command: >
+    docker exec -it {{ client_postgres_container_name }}
+    psql -U {{ client_postgres_user }} -d {{ client_name }} -c "REVOKE CONNECT ON DATABASE {{ client_name }} FROM PUBLIC"
+  register: out
+  tags:
+    - update_client_postgres
+- debug: var=out.stdout_lines
+  tags:
+    - update_client_postgres
+
+- name: Create credentials for PostgreSQL
+  copy:
+    dest: "/home/{{ ansible_user }}/pg_server.json"
+    content: |
+      {"dbname": "{{ client_name }}",
+       "host": "{{ inventory_hostname }}",
+       "user": "{{ client_postgres_user }}",
+       "password": "{{ postgreSQL_db_pass }}",
+       "db_port": "{{ postgres_port }}",
+       "server_port": "{{ ansible_port }}",
+       "server_user": "{{ ansible_user }}",
+       "server_pass": "{{ ansible_password }}"
+      }
+  tags:
+    - update_client_postgres

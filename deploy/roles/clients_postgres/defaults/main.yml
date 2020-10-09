@@ -1,0 +1,161 @@
+---
+pg_udfs: "DROP AGGREGATE IF EXISTS min(BOOLEAN);
+          CREATE OR REPLACE FUNCTION MIN2_2_bo(someNumber BOOLEAN, e1 BOOLEAN)
+          RETURNS BOOLEAN
+          immutable
+          strict
+          AS
+          $body$
+          BEGIN
+          return BOOL_AND(someNumber);
+          END;
+          $body$
+          LANGUAGE plpgsql;
+
+          CREATE OR REPLACE FUNCTION MIN2_2(someNumber BOOLEAN)
+          RETURNS BOOLEAN
+          immutable
+          strict
+          AS
+          $body$
+          BEGIN
+          return BOOL_AND(someNumber);
+          END;
+          $body$
+          LANGUAGE plpgsql;
+
+          CREATE OR REPLACE FUNCTION MIN2_2(someNumber TEXT)
+          RETURNS TEXT AS
+          $body$
+          BEGIN
+          RETURN MIN(someNumber);
+          END;
+          $body$
+          LANGUAGE plpgsql;
+
+          CREATE OR REPLACE FUNCTION MIN2_2(someNumber INTEGER)
+          RETURNS INTEGER AS
+          $body$
+          BEGIN
+          RETURN MIN(someNumber);
+          END;
+          $body$
+          LANGUAGE plpgsql;
+
+          CREATE AGGREGATE min(BOOLEAN)
+          (
+              sfunc = MIN2_2_bo,
+              stype = BOOLEAN,
+              finalfunc = MIN2_2
+          );
+
+           CREATE OR REPLACE FUNCTION generate_create_table_statement(tmp_view_name text)
+           RETURNS text AS
+           $funct$
+           DECLARE
+           v_table_ddl   text;
+           column_record record;
+           BEGIN
+           FOR column_record IN
+           SELECT
+           b.nspname as schema_name, b.relname as table_name, a.attname as column_name,
+           pg_catalog.format_type(a.atttypid, a.atttypmod) as column_type, a.attnum as attnum,
+           e.max_attnum as max_attnum
+           FROM pg_catalog.pg_attribute a INNER JOIN
+           (SELECT c.oid, n.nspname, c.relname FROM pg_catalog.pg_class c
+           LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+           WHERE c.relname = tmp_view_name AND relpersistence = 't'
+           ORDER BY 2, 3) b ON a.attrelid = b.oid INNER JOIN
+           (SELECT a.attrelid, max(a.attnum) as max_attnum FROM pg_catalog.pg_attribute a
+           WHERE a.attnum > 0 AND NOT a.attisdropped GROUP BY a.attrelid) e
+           ON a.attrelid=e.attrelid
+           WHERE a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum
+           LOOP
+           IF column_record.attnum = 1 THEN
+           v_table_ddl:='CREATE TABLE '||column_record.table_name||' (';
+           ELSE
+           v_table_ddl:=v_table_ddl||',';
+           END IF;
+
+           IF column_record.attnum <= column_record.max_attnum THEN
+           v_table_ddl:=v_table_ddl||chr(10)||'    '||column_record.column_name||' '||column_record.column_type;
+           END IF;
+           END LOOP;
+
+           v_table_ddl:=v_table_ddl||')';
+           RETURN v_table_ddl;
+           END;
+           $funct$
+           LANGUAGE 'plpgsql';
+
+           CREATE OR REPLACE FUNCTION declare_partitions(t_name text, start_date date) RETURNS VOID AS
+           $funct$
+           DECLARE
+           d date;
+           BEGIN
+           FOR d IN SELECT generate_series(start_date, CURRENT_TIMESTAMP::date + INTERVAL '1 year', INTERVAL '1 month') LOOP
+           EXECUTE 'CREATE UNLOGGED TABLE ' || t_name || '_p' || to_char(d, 'YYYY') || to_char(d, 'MM') ||
+           ' PARTITION OF ' || t_name || ' FOR VALUES FROM (''' || d || ''') TO (''' || d + INTERVAL '1month' || ''');';
+           END LOOP;
+           END;
+           $funct$
+           LANGUAGE 'plpgsql';
+
+           CREATE OR REPLACE FUNCTION create_partitioned_table(view_name text, s_name text, start_date date,
+           partition_field text default '__datetime')
+           RETURNS VOID AS
+           $funct$
+           DECLARE
+           t_name text := s_name || '.' || RTRIM(view_name, '_v');
+           BEGIN
+           EXECUTE 'DROP TABLE IF EXISTS ' || t_name || ' CASCADE;';
+           EXECUTE regexp_replace(generate_create_table_statement(view_name),
+           '^CREATE TABLE ' || view_name, 'CREATE TABLE ' || t_name)
+           || ' PARTITION BY RANGE (' || partition_field || ');';
+           PERFORM declare_partitions(t_name, start_date);
+           END
+           $funct$
+           LANGUAGE 'plpgsql';
+
+           CREATE OR REPLACE FUNCTION update_partition_view(view_name text, new_partition text,
+           materialize boolean DEFAULT FALSE) RETURNS VOID AS
+           $funct$
+           DECLARE
+           old_query text := pg_get_viewdef(view_name::regclass, true);
+           BEGIN
+           EXECUTE 'CREATE OR REPLACE ' || CASE WHEN materialize THEN 'MATERIALIZED ' ELSE '' END || 'VIEW ' || view_name || ' AS '
+           || '(' || regexp_replace(rtrim(old_query, ';'), '_p\\d{6}', '_p' || new_partition, 'g')  || ')';
+           END;
+           $funct$
+           LANGUAGE 'plpgsql';
+
+           CREATE OR REPLACE FUNCTION create_full_view_from_partition(view_name text, s_name text, start_date date,
+           materialized boolean DEFAULT FALSE)
+           RETURNS VOID AS
+           $funct$
+           DECLARE
+           view_partition text;
+           full_view_name text;
+           d date;
+           view_def text := TRIM(';' FROM pg_get_viewdef(s_name || '.' || view_name));
+           q text;
+           m_text text := CASE WHEN materialized THEN 'MATERIALIZED' ELSE '' END;
+           BEGIN
+           IF NOT view_name ~ '_v\\d{6}$' THEN
+           RAISE EXCEPTION 'View name must end with _vYYYYMM where YYYY is year and MM is month';
+           END IF;
+           view_partition := '_p' || RIGHT(view_name, 6);
+           full_view_name := LEFT(view_name, LENGTH(view_name) - 6);
+           q := 'DROP ' || m_text || ' VIEW IF EXISTS ' || s_name || '.' || full_view_name ||  '; CREATE ' || m_text ||
+           ' VIEW ' || s_name || '.' || full_view_name || ' AS ';
+           FOR d IN SELECT generate_series(start_date, CURRENT_TIMESTAMP::date, INTERVAL '1 month') LOOP
+           q := q || regexp_replace(view_def, view_partition, '_p' || to_char(d, 'YYYY') || to_char(d, 'MM'), 'g');
+           IF d + INTERVAL '1 month' <= CURRENT_TIMESTAMP::date THEN
+           q := q || ' UNION ALL ';
+           END IF;
+           END LOOP;
+           RAISE NOTICE '%', q;
+           EXECUTE q;
+           END
+           $funct$
+           LANGUAGE 'plpgsql';"

@@ -1,0 +1,232 @@
+- name: Add the user '{{ ansible_user }}' to the 'docker' group
+  user:
+    name: "{{ ansible_user }}"
+    group: docker
+    append: yes
+  tags:
+    - update_airflow
+
+- name: Log into DockerHub
+  docker_login:
+    username: "{{ dockerhub_login }}"
+    password: "{{ dockerhub_pass }}"
+  tags:
+    - update_airflow
+
+- name: Stop and remove existing airflow_keybunch Docker container
+  docker_container:
+    name: "{{ airflow_container_name }}"
+    state: absent
+  tags:
+    - update_airflow
+
+- name: Remove existing airflow_keybunch Docker image
+  docker_image:
+    state: absent
+    name: adventum/advm_etl
+    tag: "{{ airflow_image }}"
+  tags:
+    - update_airflow
+
+- name: Stop and remove existing commands_ui Docker container
+  docker_container:
+    name: "{{ commands_ui_container_name }}"
+    state: absent
+  tags:
+    - commands_ui
+    - update_airflow
+
+- name: Remove existing commands_ui Docker image
+  docker_image:
+    state: absent
+    name: adventum/advm_etl
+    tag: "{{ commands_ui_image }}"
+  tags:
+    - commands_ui
+    - update_airflow
+
+- name: Remove a volume
+  docker_volume:
+    name: advm_etl_volume
+    state: absent
+  tags:
+    - update_airflow
+
+- name: Create advm_configs dir
+  file:
+    path: "/home/{{ ansible_user }}/advm_configs"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: docker
+    mode: '750'
+  tags:
+    - update_airflow
+
+- name: Copy advm_configs files to remote host
+  synchronize:
+    src:  "{{ local_advm_configs_dir }}"
+    dest: "/home/{{ ansible_user }}/advm_configs"
+    rsync_path: /usr/bin/rsync
+    rsync_opts:
+      - "--exclude=.git"
+      - "--exclude=deploy"
+      - "--exclude=.gitignore"
+  tags:
+    - update_airflow
+
+- name: Create volume mounting dir for Airflow PostgreSQL
+  file:
+    path: "/var/{{ airflow_postgres_container_name }}/data"
+    state: directory
+    mode: '750'
+  tags:
+    - update_airflow
+
+- name: Install Postgres for Airflow
+  docker_container:
+    name: "{{ airflow_postgres_container_name }}"
+    image: postgres
+    interactive: true
+    tty: true
+    restart_policy: always
+    volumes:
+      - "/var/{{ airflow_postgres_container_name }}/data:/var/lib/postgresql/data"
+    env:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: '{{ airflow_pg_pass }}'
+      POSTGRES_DB: airflow
+    log_options:
+      max-size: 10m
+      max-file: "3"
+  tags:
+    - update_airflow
+
+- name: Create new user in PostgreSQL
+  command: >
+    docker exec -it {{ airflow_postgres_container_name }}
+    psql -U airflow -c
+    "CREATE USER {{ commands_ui_postgres_user }} WITH PASSWORD '{{ commands_ui_pg_pass }}' CREATEDB;"
+  register: out
+- debug: var=out.stdout_lines
+
+- name: Create new database in PostgreSQL
+  command: >
+    docker exec -it {{ airflow_postgres_container_name }}
+    psql -U {{ commands_ui_postgres_user }} -d postgres -c "CREATE DATABASE {{ commands_ui_db_name }}"
+  register: out
+- debug: var=out.stdout_lines
+
+- name: Wait for Postgres for Airflow to start up before proceeding
+  ignore_errors: yes
+  command: >
+    docker exec -it {{ airflow_postgres_container_name }}
+    psql -U airflow -c "SELECT pg_size_pretty(pg_database_size(current_database()))"
+  args:
+    warn: false
+  register: result
+  until: result is succeeded
+  retries: 20
+  delay: 5
+  changed_when: false
+  check_mode: false
+  tags:
+    - update_airflow
+
+- name: Install Airflow for Keybunch
+  docker_container:
+    name: "{{ airflow_container_name }}"
+    image: "adventum/advm_etl:{{ airflow_image }}"
+    interactive: true
+    tty: true
+    restart_policy: always
+    ports:
+      - "{{ airflow_port }}:8080"
+    volumes:
+      - "/home/{{ ansible_user }}/advm_configs:/opt/advm_configs"
+      - "advm_etl_volume:/opt/advm_etl"
+    log_options:
+      max-size: 10m
+      max-file: "3"
+    command: webserver
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f /usr/local/airflow/airflow-webserver.pid ]"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+    links:
+      - "{{ airflow_postgres_container_name }}:pstgr"
+    env:
+      LOAD_EX: "n"
+      EXECUTOR: "Local"
+      FERNET_KEY: "{{ fernet_key }}"
+      AIRFLOW__CORE__EXECUTOR: "LocalExecutor"
+      POSTGRES_HOST: "{{ airflow_postgres_container_name }}"
+      POSTGRES_PORT: "5432"
+      POSTGRES_PASSWORD: "{{ airflow_pg_pass }}"
+      POSTGRES_DB: "airflow"
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://airflow:{{ airflow_pg_pass }}@{{ airflow_postgres_container_name }}:5432/airflow"
+      ADVM_ETL_LOG_LEVEL: "{{ advm_etl_log_level }}"
+      ADVM_ETL_LOGSTASH_LOGGING: "{{ advm_etl_logstash_logging }}"
+      LOGSTASH_IP_ADDRESS: "{{ logstash_ip_address }}"
+      LOGSTASH_PORT: "{{ logstash_port }}"
+
+      AIRFLOW__SMTP__SMTP_HOST: "{{ airflow_smtp }}"
+      AIRFLOW__SMTP__SMTP_USER: "mfreport@adventum.ru"
+      AIRFLOW__SMTP__SMTP_PORT: "587"
+      AIRFLOW__SMTP__SMTP_MAIL_FROM: "airflow@{{ client_name }}.ru"
+      AIRFLOW__SMTP__SMTP_PASSWORD: "{{ SMTP_PASSWORD }}"
+  tags:
+    - update_airflow
+
+- name: Wait 20 sec for Airflow loading
+  wait_for:
+    timeout: 20
+  tags:
+    - update_airflow
+
+- name: Add variables for Airflow
+  command: >
+    docker exec -it {{ airflow_container_name }} bash -l -c "airflow variables -s {{ item.key }} {{ item.value }};"
+  loop: "{{ lookup('dict', airflow_vars) }}"
+  tags:
+    - update_airflow
+
+- name: Create airflow_admin user
+  command: >
+    docker exec -it {{ airflow_container_name }}
+    python create_admin.py {{ airflow_admin_password }}
+
+- name: Install advm_etl_commands_ui
+  docker_container:
+    name: "{{ commands_ui_container_name }}"
+    image: "adventum/advm_etl:{{ commands_ui_image }}"
+    interactive: true
+    tty: true
+    restart_policy: always
+    ports:
+      - "{{ commands_ui_port }}:5005"
+    volumes:
+      - "advm_etl_volume:/opt/advm_etl"
+      - "/home/{{ ansible_user }}/advm_configs:/opt/advm_configs"
+    log_options:
+      max-size: 10m
+      max-file: "3"
+    links:
+      - "{{ airflow_postgres_container_name }}:pstgr"
+    env:
+      COMMANDS_UI_DEBUG_MODE: "false"
+      COMMANDS_UI_SECRET_KEY: "{{ commands_ui_secret_key }}"
+      COMMANDS_UI_DATABASE_URL: "postgresql+psycopg2://{{ commands_ui_postgres_user }}:{{ commands_ui_pg_pass }}@{{ airflow_postgres_container_name }}:5432/{{ commands_ui_db_name }}"
+      COMMANDS_UI_ADMIN_PASSWORD: "{{ commands_ui_admin_pass }}"
+      COMMANDS_UI_LOG_DIRECTORY: "{{ commands_ui_log_directory }}"
+      COMMANDS_UI_LOG_LEVEL: "{{ commands_ui_log_level }}"
+      COMMANDS_UI_LOGSTASH_LOGGING: "{{ commands_ui_logstash_logging }}"
+
+      ADVM_ETL_LOG_LEVEL: "{{ advm_etl_log_level }}"
+      ADVM_ETL_LOGSTASH_LOGGING: "{{ advm_etl_logstash_logging }}"
+
+      LOGSTASH_IP_ADDRESS: "{{ logstash_ip_address }}"
+      LOGSTASH_PORT: "{{ logstash_port }}"
+  tags:
+    - commands_ui
+    - update_airflow
